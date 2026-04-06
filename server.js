@@ -1,9 +1,6 @@
 // ============================================================
-// Playwright Headless Chrome — Railway Service
-// Бесплатная замена Browserless для n8n
-//
-// POST /content  { "url": "...", "waitForTimeout": 3000 }
-// GET  /health   → { "status": "ok" }
+// Playwright Headless Chrome — Railway Service v2
+// With request queue to prevent concurrent crashes
 // ============================================================
 
 const http = require('http');
@@ -13,12 +10,43 @@ const PORT = process.env.PORT || 3033;
 
 let browser = null;
 let requestCount = 0;
+const MAX_REQUESTS_BEFORE_RESTART = 100;
 
-// Перезапускаем браузер каждые N запросов (экономия RAM на Railway)
-const MAX_REQUESTS_BEFORE_RESTART = 50;
+// ---- Request Queue ----
+// Ensures only one page is processed at a time
+const queue = [];
+let processing = false;
 
+function enqueue(task) {
+  return new Promise((resolve, reject) => {
+    queue.push({ task, resolve, reject });
+    processQueue();
+  });
+}
+
+async function processQueue() {
+  if (processing || queue.length === 0) return;
+  processing = true;
+
+  const { task, resolve, reject } = queue.shift();
+  try {
+    const result = await task();
+    resolve(result);
+  } catch (err) {
+    reject(err);
+  } finally {
+    processing = false;
+    // Process next item
+    if (queue.length > 0) {
+      setImmediate(processQueue);
+    }
+  }
+}
+
+// ---- Browser Management ----
 async function getBrowser() {
   if (!browser || !browser.isConnected()) {
+    console.log('[playwright] Launching browser...');
     browser = await chromium.launch({
       headless: true,
       args: [
@@ -33,7 +61,6 @@ async function getBrowser() {
         '--disable-sync',
         '--disable-translate',
         '--no-first-run',
-        '--disable-features=site-per-process',
       ],
     });
     requestCount = 0;
@@ -65,18 +92,18 @@ async function getPageContent(url, waitForTimeout = 3000) {
   const page = await context.newPage();
 
   try {
-    // Блокируем тяжёлые ресурсы для скорости
+    // Block heavy resources for speed
     await page.route('**/*.{png,jpg,jpeg,gif,svg,webp,woff,woff2,ttf,eot}', (route) =>
       route.abort()
     );
     await page.route('**/*', (route) => {
-      const url = route.request().url();
+      const reqUrl = route.request().url();
       if (
-        url.includes('google-analytics') ||
-        url.includes('googletagmanager') ||
-        url.includes('facebook.net') ||
-        url.includes('doubleclick') ||
-        url.includes('hotjar')
+        reqUrl.includes('google-analytics') ||
+        reqUrl.includes('googletagmanager') ||
+        reqUrl.includes('facebook.net') ||
+        reqUrl.includes('doubleclick') ||
+        reqUrl.includes('hotjar')
       ) {
         return route.abort();
       }
@@ -97,11 +124,12 @@ async function getPageContent(url, waitForTimeout = 3000) {
   }
 }
 
+// ---- HTTP Server ----
 const server = http.createServer(async (req, res) => {
-  // Health-check (Railway uses this)
+  // Health-check
   if (req.method === 'GET' && (req.url === '/health' || req.url === '/')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', requests: requestCount }));
+    res.end(JSON.stringify({ status: 'ok', requests: requestCount, queue: queue.length }));
     return;
   }
 
@@ -119,15 +147,25 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
-        console.log(`[#${requestCount + 1}] ${url} (wait: ${waitForTimeout}ms)`);
+        console.log(`[queued #${requestCount + 1}] ${url} (wait: ${waitForTimeout}ms) [queue: ${queue.length}]`);
         const start = Date.now();
-        const html = await getPageContent(url, waitForTimeout);
-        console.log(`[#${requestCount}] Done in ${Date.now() - start}ms, ${html.length} bytes`);
+
+        // Process through queue — one at a time
+        const html = await enqueue(() => getPageContent(url, waitForTimeout));
+
+        console.log(`[done #${requestCount}] ${Date.now() - start}ms, ${html.length} bytes`);
 
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(html);
       } catch (err) {
         console.error('[error]', err.message);
+
+        // If browser crashed, reset it for next request
+        if (err.message.includes('closed') || err.message.includes('crashed')) {
+          try { if (browser) await browser.close(); } catch (e) { /* ignore */ }
+          browser = null;
+        }
+
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: err.message }));
       }
@@ -141,7 +179,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[playwright-service] Running on port ${PORT}`);
-  console.log(`[playwright-service] POST /content — get rendered HTML`);
+  console.log(`[playwright-service] POST /content — get rendered HTML (queued)`);
   console.log(`[playwright-service] GET  /health  — health check`);
 });
 
