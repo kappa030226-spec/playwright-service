@@ -1,0 +1,12 @@
+{
+  "name": "playwright-html-service",
+  "version": "1.0.0",
+  "description": "Free Browserless replacement for n8n on Railway",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "playwright": "^1.52.0"
+  }
+}
